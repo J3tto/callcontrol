@@ -1,0 +1,78 @@
+# Reading new-Teams in-call state on macOS without the retired API
+
+Research for issue #3. Question: with the third-party call-control API gone, how can a Swift helper read *in call*, *mic muted*, *camera on*, *hand raised* from the new Teams Mac client, and which mechanism is most reliable?
+
+## Verdict
+
+Use the Accessibility API on the meeting window's toolbar, after setting `AXEnhancedUserInterface` on the Teams app element, and poll (no usable notification path). It is the only mechanism that reads all four states, and it is what every working open-source tool and MuteDeck ("interface discovery") do today. Pair it with a CoreAudio process-object check for a cheap, permission-free "in a call" signal.
+
+## What the new Teams Mac client is
+
+- Microsoft describes the new client's host as "WebView2" and the moderator of a Microsoft Q&A thread refers to "the WebView2 control within the Teams desktop client" ([Microsoft Q&A, 2024-06-04](https://learn.microsoft.com/en-ie/answers/questions/1691245/support-of-browser-extensions-with-native-messagin)). I could not locate a Microsoft page that says this specifically for macOS (the Tech Community architecture post is JS-rendered and would not fetch).
+- The installed bundle confirms it is Chromium/Edge, not WebKit and not Electron: a captured process listing shows `/Applications/Microsoft Teams.app/Contents/Helpers/Microsoft Teams WebView.app/Contents/Frameworks/Microsoft Edge Framework.framework/Versions/138.0.3351.83/Helpers/Microsoft Teams WebView Helper (Renderer).app` ([ChowdriS/Intern_SelfLearn terminal.log](https://github.com/ChowdriS/Intern_SelfLearn/blob/main/Powershell/Day1/terminal.log)); Installomator lists `Microsoft Teams WebView` / `Microsoft Teams WebView Helper` as the app's blocking processes ([Installomator label](https://github.com/Installomator/Installomator/blob/main/fragments/labels/microsoftteams-rollingout.sh)). Bundle ID is `com.microsoft.teams2`. Verify on the dev Mac with `ls "/Applications/Microsoft Teams.app/Contents/Helpers"`.
+- Consequence: the AX tree is Chromium's. Chromium exposes web content to AX clients only when it believes assistive technology is present; on macOS it watches `NSWorkspace.voiceOverEnabled` and the "undocumented accessibility attribute `AXEnhancedUserInterface`, which is set by other assistive technologies" ([browser_accessibility_state_impl.h](https://github.com/chromium/chromium/blob/main/content/browser/accessibility/browser_accessibility_state_impl.h)). Setting that attribute enables "screen reader complete mode" after a 2 s debounce ([chrome_browser_application_mac.mm](https://github.com/chromium/chromium/blob/main/chrome/browser/chrome_browser_application_mac.mm), `accessibilitySetValue:forAttribute:`). `AXManualAccessibility` is Electron-only: Electron adds it in its own NSApplication subclass ([electron_application.mm](https://github.com/electron/electron/blob/main/shell/browser/mac/electron_application.mm), [Electron docs](https://www.electronjs.org/docs/latest/tutorial/accessibility)); plain Chromium/WebView2 does not implement it.
+
+## Ranked mechanisms
+
+### 1. Accessibility API (AXUIElement) — reads all four states
+
+**Exposure.** The meeting toolbar is exposed once the tree is enabled. Buttons are `AXButton` with the accessible name in `AXDescription` (sometimes also `AXTitle`); `AXValue` is not used for mute/camera state. Confirmed labels: `"Mute mic"` / `"Unmute mic"`, `"Turn camera off"` / `"Turn camera on"` ([TEAMS2HA ax_probe.rs, confirmed live 2026-08-16](https://github.com/jimmyeao/TEAMS2HA/blob/master/tauri/src-tauri/examples/ax_probe.rs); [MacMute TeamsAccessibility.swift](https://github.com/TuanBT/MacMute/blob/main/Sources/MacMute/TeamsAccessibility.swift), build 26213: "an AXButton described 'Mute mic'"). The label names the action, so `"Unmute mic"` means muted. Labels are localized (German `"Mikrofon stummschalten"` seen in [meeting-notes TeamsMuteReader.swift](https://github.com/SyntaxFisher/meeting-notes/blob/main/TeamsMuteReader.swift)).
+
+**Stable identifiers.** Chromium exposes the HTML `id` as `AXDOMIdentifier` and the class list as `AXDOMClassList` ([ax_platform_node_cocoa.mm](https://github.com/chromium/chromium/blob/main/ui/accessibility/platform/ax_platform_node_cocoa.mm)). Teams 26267 for Mac uses ids `microphone-button`, `video-button`, `hangup-button`, `share-button`, `reaction-menu-button`, `video-button-configure`, `callingButtons-showMoreBtn`, `roster-button`, `chat-button`; the React menu holds `raisehands-button` (labels "raise"/"lower") ([tally-for-teams selectors.ts, confirmed 2026-09-29](https://github.com/mpalermiti/tally-for-teams/blob/main/src/teams/selectors.ts)). Match on ids first, labels second; ids survive localization.
+
+**Hand raised.** Not a toolbar label: "a raised hand keeps React's label; only its look changes", so Tally compares `AXDOMClassList` of the React button against plain toolbar buttons ([tally DEVELOPMENT.md](https://github.com/mpalermiti/tally-for-teams/blob/main/DEVELOPMENT.md), [TeamsBridge.swift](https://github.com/mpalermiti/tally-for-teams/blob/main/bridge/TeamsBridge.swift)). Alternative: open the React menu and read `raisehands-button`'s label, which costs a UI interaction. Treat hand state as the least reliable of the four.
+
+**In call.** Presence of the `microphone-button` (or any `hangup-button`/"Leave") element in a window is the in-call signal used by every tool; the tree has no separate call-state attribute.
+
+**Notifications vs polling.** `AXObserverAddNotification` exists ([AXUIElement.h](https://github.com/phracker/MacOSX-SDKs/blob/master/MacOSX11.3.sdk/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/HIServices.framework/Versions/A/Headers/AXUIElement.h)), but `kAXValueChangedNotification` fires only for the `AXValue` attribute ([AXNotificationConstants.h](https://github.com/phracker/MacOSX-SDKs/blob/master/MacOSX11.3.sdk/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/HIServices.framework/Versions/A/Headers/AXNotificationConstants.h)), and Teams carries state in `AXDescription`. No tool I read uses an observer; all poll cached elements: 0.5 s ([MacMute](https://github.com/TuanBT/MacMute/blob/main/Sources/MacMute/TeamsAccessibility.swift), [Tally](https://github.com/mpalermiti/tally-for-teams/blob/main/bridge/TeamsBridge.swift)), 750 ms ([TEAMS2HA uia_monitor.rs](https://github.com/jimmyeao/TEAMS2HA/blob/master/tauri/src-tauri/src/uia_monitor.rs)). Re-reading two attributes on a cached element is ~0 ms; a full window walk is 50–450 ms (Tally) or ~35 ms (MacMute). Whether `kAXTitleChangedNotification` / `kAXUIElementDestroyedNotification` fire from WebView2 is **unverified**.
+
+**The intermittently-missing button.** This is the lazily-built Chromium tree, not a Teams bug. Apple forum reports ([thread 763286](https://developer.apple.com/forums/thread/763286), FB15337776; [thread 756895](https://developer.apple.com/forums/thread/756895)) and the Microsoft Tech Community thread ([4033014](https://techcommunity.microsoft.com/discussions/teamsdeveloper/enable-accessibility-tree-on-macos-in-the-new-teams-work-or-school/4033014)) all describe elements appearing only while VoiceOver or Accessibility Inspector runs; Microsoft's only reply redirected to UserVoice. The fix, independently found by four projects:
+
+- Set `AXEnhancedUserInterface = true` on `AXUIElementCreateApplication(pid)`. The call **returns an error (`kAXErrorNotImplemented`, -25208) yet takes effect**; read-back flips to 1 and the tree populates ([Overtype research, 2026-08-02](https://github.com/stn1slv/Overtype/blob/main/specs/005-teams-ax-recovery/research.md); [Tally probe](https://github.com/mpalermiti/tally-for-teams/blob/main/probe/teams-ax-probe.swift): "the call reports an error, but the tree appears").
+- `AXManualAccessibility` alone does nothing on Teams (`kAXErrorAttributeUnsupported`); MacMute sets both and notes that with `AXManualAccessibility` alone build 26213 exposes 20 nodes per window and no mute button, with both about 380.
+- Teams ignores the switch while still launching; Tally re-requests it every 2 s until a web area appears, and re-asserts it every 5 s if a cached button loses its `AXPress` action (which happens when VoiceOver or another tool turns the mode off). Leave it on; Teams reports the attribute as off even while it is on, so "restoring" it breaks other clients.
+- The tree builds asynchronously; Tally rescans at 0.75 s until the mic button appears (8 s cap). TEAMS2HA observed a meeting's content staying a childless "Web content" `AXGroup` for minutes with no flag helping — **conflicting evidence, unverified** which build/condition caused it.
+- Set `AXUIElementSetMessagingTimeout` (0.25–2 s) on the app element; a busy Teams otherwise blocks each call for the 6 s default.
+
+Requires the Accessibility permission (`AXIsProcessTrusted`), granted to the helper's host app.
+
+### 2. CoreAudio process objects — "in a call", permission-free
+
+Since macOS 14 CoreAudio exposes per-process objects: `kAudioHardwarePropertyProcessObjectList`, `kAudioProcessPropertyBundleID`, `kAudioProcessPropertyIsRunningInput` ("the process is running IO and there is at least one active input stream") ([AudioHardware.h, macOS 14.5 SDK](https://github.com/alexey-lysiuk/macos-sdk/blob/main/MacOSX14.5.sdk/System/Library/Frameworks/CoreAudio.framework/Versions/A/Headers/AudioHardware.h)). Teams' media runs in `com.microsoft.teams2.modulehost`; its input and output are both running during a call, which one project uses as its in-call gate ([heylisten teams-plan.md](https://github.com/nikolaia/heylisten/blob/main/teams-plan.md), field notes). **Cannot read mute**: "Teams keeps the mic claimed while you're muted" (same source). Cannot read camera or hand. Older API `kAudioDevicePropertyDeviceIsRunningSomewhere` is device-wide, not per-process ([AudioHardware.h](https://github.com/phracker/MacOSX-SDKs/blob/master/MacOSX11.3.sdk/System/Library/Frameworks/CoreAudio.framework/Versions/A/Headers/AudioHardware.h)).
+
+### 3. Teams log file — in call, join/leave; mute direction unknown
+
+New Teams writes `~/Library/Group Containers/UBF8T346G9.com.microsoft.teams/Library/Application Support/Logs/MSTeams_*.log`, readable without a TCC prompt, rotating at ~2 MB, flushed in 4 KB blocks so lines land 5–30 s late ([heylisten](https://github.com/nikolaia/heylisten/blob/main/teams-plan.md); same path in [onair](https://github.com/dannotes/onair/blob/main/README.md), [teams-presence-ha](https://github.com/bistick/teams-presence-ha), [teams_status_viewer](https://github.com/mikagorka/teams_status_viewer/blob/main/teams_monitor.py)). Microsoft documents only on-demand "Collect support files" output and says weblogs are plain text ([Microsoft Learn: log files](https://learn.microsoft.com/en-us/microsoftteams/log-files)); the path and format are undocumented. Observed events: presence `OnAvailabilityUpdate` with `InACall`, `call_state": "Connected`, window open/close for join/leave, and `AirPodsModule::SetMuteState: OOP call` once per mute toggle with **no direction** (heylisten). Too laggy for a button that must flip within a second; useful only as a fallback for "in a call".
+
+### 4. CoreMediaIO camera — camera on, not per-process
+
+`kCMIODevicePropertyDeviceIsRunningSomewhere`: "1 means that the CMIODevice is running in at least one process on the system" ([CMIOHardwareDevice.h](https://github.com/phracker/MacOSX-SDKs/blob/master/MacOSX11.3.sdk/System/Library/Frameworks/CoreMediaIO.framework/Versions/A/Headers/CMIOHardwareDevice.h); used by [Hammerspoon hs.camera:isInUse](https://github.com/Hammerspoon/hammerspoon/blob/master/extensions/camera/libcamera.m)). Tells you a camera is on, not whose; a listener also fired spuriously on macOS 12 ([Apple forum 697124](https://developer.apple.com/forums/thread/697124)). Apple deliberately restricted sandboxed apps from learning which app uses the camera (CVE-2022-32913, [Apple security content](https://support.apple.com/en-us/HT213488)). Cannot read mute (Teams keeps the mic open) or hand.
+
+### 5. Unified log (`log stream`) — attribution only
+
+OverSight attributes camera/mic use to a pid on macOS 14+ with predicate `subsystem=='com.apple.cmio' OR subsystem=='com.apple.coremedia'`, matching `added <private> endpoint <private> camera <private>` and `-[MXCoreSession beginInterruption]: Session <ID: xx, PID = xyz, ... Recording = YES> is going active` ([OverSight AVMonitor.m](https://github.com/objective-see/OverSight/blob/main/Application/Application/AVMonitor.m)). Another project reads `audiomxd` `isRecording: true/false` lines ([meeting-notes-processor](https://github.com/ewilderj/meeting-notes-processor/blob/main/transcriber/AGENTS.md)). Undocumented strings, `<private>` redaction, and no mute/hand state; not worth building on.
+
+## How existing tools read Teams today
+
+MuteDeck: "Microsoft Teams discovery and control will work out of the box in MuteDeck, using interface discovery methods... if your Microsoft Teams language is not supported, MuteDeck will not be able to detect the meeting state", and it requires the Accessibility permission on macOS ([MuteDeck help: Teams setup](https://mutedeck.com/help/features/microsoft-teams-setup), [app not detecting](https://mutedeck.com/help/troubleshooting/app-not-detecting)). Language dependence implies label matching, not DOM ids. Open source (all AX + polling, sources linked above): MacMute, Tally for Teams (a Stream Deck plugin with a Swift bridge, the closest prior art), TEAMS2HA, meeting-notes, MeetingSquelch, TeamsControl.spoon/teams-mac-hotkeys (Hammerspoon). MacMute notes the local API answered on port 8124 in build 26198 and was gone in 26213.
+
+## Recommended first spike
+
+Swift helper, polling AX:
+
+1. `AXIsProcessTrustedWithOptions` prompt; find `NSRunningApplication` for `com.microsoft.teams2`.
+2. `app = AXUIElementCreateApplication(pid)`; `AXUIElementSetMessagingTimeout(app, 1.0)`; `AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface", kCFBooleanTrue)` (ignore the error; also set `AXManualAccessibility`, harmless). Re-send every 2 s until a web area appears.
+3. Walk `kAXWindowsAttribute` → `kAXChildrenAttribute` (budget ~4000 nodes, depth ~45), collecting elements whose `kAXRoleAttribute` is `AXButton`/`AXMenuButton`, keyed by `AXDOMIdentifier`, falling back to `kAXIdentifierAttribute` then `AXDescription`/`AXTitle`.
+4. State: in call = `microphone-button` found; muted = its label matches `^unmute`; camera on = `video-button` label contains `off`; hand = `AXDOMClassList` of `reaction-menu-button` differs from the plain toolbar buttons (verify against `raisehands-button` label in the React menu in the probe).
+5. Cache the elements; every 500 ms re-read `AXDescription` (and `AXDOMClassList` for React). On an attribute read failure or `AXUIElementCopyActionNames` lacking `AXPress`, re-assert the flag and rescan.
+6. Optional, no permission: `kAudioHardwarePropertyProcessObjectList` → process with bundle ID `com.microsoft.teams2.modulehost` → `kAudioProcessPropertyIsRunningInput` as a fast in-call pre-check.
+
+Run Tally's `probe/teams-ax-probe.swift` first against the installed build to confirm ids and labels before coding.
+
+## Unverified
+
+- A Microsoft statement that the **Mac** client is WebView2 (bundle evidence only).
+- Whether any AX notification fires for toolbar label changes in WebView2.
+- Why TEAMS2HA saw minutes-long empty web content when others see sub-second population.
+- Hand-raised detection via `AXDOMClassList`: one project's observation on one build.
+- Teams log mute parity (join-unmuted case) and whether lines carry direction.
